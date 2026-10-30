@@ -1,0 +1,19 @@
+name: runner-probe
+
+# Manual diagnostic to check which hosted runners can start in this repository.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm, ubuntu-22.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - run: uname -a && nproc && free -h && df -h /
