@@ -1,0 +1,120 @@
+name: build-linux-arm64
+
+# Builds the Cindy desktop app as a Linux arm64 .deb on a native aarch64 runner.
+# Upstream packaging does not support cross-compilation, so this must run on ARM.
+
+on:
+  workflow_dispatch:
+    inputs:
+      skip_smoke:
+        description: Skip the packaged smoke test
+        type: boolean
+        default: false
+  push:
+    branches:
+      - build
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-linux-arm64-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UPSTREAM_REPO: makecindy/cindy
+  UPSTREAM_TAG: v0.1.121
+  NODE_OPTIONS: '--max-old-space-size=8192'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: false
+
+      - name: Fetch sqlite-vec arm64 binary from upstream Git LFS
+        run: |
+          set -euo pipefail
+          target=apps/desktop/native/sqlite-vec/linux-arm64/vec0.so
+          oid=$(awk '/^oid sha256:/{sub("sha256:","",$2); print $2}' "$target")
+          echo "Expected sha256: $oid"
+          curl -fsSL -o /tmp/vec0.so \
+            "https://media.githubusercontent.com/media/${UPSTREAM_REPO}/${UPSTREAM_TAG}/${target}"
+          echo "$oid  /tmp/vec0.so" | sha256sum -c -
+          mv /tmp/vec0.so "$target"
+          file "$target"
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            fakeroot dpkg dpkg-dev desktop-file-utils python3 make gcc g++ \
+            libarchive-tools binutils file xvfb xauth \
+            libgtk-3-0t64 libnss3 libasound2t64 libxss1 libxtst6 libnotify4 \
+            libdrm2 libgbm1 libsecret-1-0 libsecret-1-dev xdg-utils
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Package Linux arm64 .deb
+        working-directory: apps/desktop
+        env:
+          SKIP_SMOKE: ${{ inputs.skip_smoke && '--skip-smoke' || '' }}
+        run: |
+          xvfb-run -a node scripts/package-desktop.mjs --platform linux --arch arm64 $SKIP_SMOKE
+
+      - name: Collect and verify artifact
+        id: collect
+        run: |
+          set -euo pipefail
+          deb=$(find apps/desktop/release/artifacts -name '*.deb' | head -n1)
+          test -n "$deb"
+          mkdir -p dist
+          name="cindy-${UPSTREAM_TAG#v}-linux-arm64.deb"
+          cp "$deb" "dist/$name"
+          info=$(find apps/desktop/release/artifacts -name 'build-info.json' | head -n1)
+          [ -n "$info" ] && cp "$info" dist/build-info.json
+          dpkg-deb -I "dist/$name"
+          dpkg-deb -I "dist/$name" | grep -q 'Architecture: arm64'
+          mkdir -p /tmp/x && dpkg-deb -x "dist/$name" /tmp/x
+          find /tmp/x \( -name '*.node' -o -name 'vec0.so' -o -name 'rg' \) -exec file {} \; | tee dist/native-files.txt
+          if grep -E 'x86-64' dist/native-files.txt; then echo 'Found x86-64 native files'; exit 1; fi
+          (cd dist && sha256sum "$name" > "$name.sha256")
+          ls -la dist
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cindy-linux-arm64
+          path: dist/
+          if-no-files-found: error
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${UPSTREAM_TAG}-arm64-run${GITHUB_RUN_NUMBER}"
+          gh release create "$tag" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Cindy ${UPSTREAM_TAG} Linux arm64 (unofficial build)" \
+            --notes "Unofficial Linux arm64 .deb built natively on ubuntu-24.04-arm from ${UPSTREAM_REPO}@${UPSTREAM_TAG}. Versionless community package (app version 0.0.0, in-app updates disabled)."
